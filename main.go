@@ -1,15 +1,21 @@
 package main
 
 import (
-	"bufio"
+	"bytes"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"os"
+	"strings"
+	"text/tabwriter"
+
+	"github.com/klauspost/compress/zstd"
 )
 
-type Entry struct {
+type LogData struct {
 	ResourceLogs []ResourceLogs `json:"resourceLogs"`
 }
 
@@ -22,13 +28,14 @@ type ScopeLogs struct {
 }
 
 type LogRecords struct {
-	TimeUnixNano string           `json:"timeUnixNano"`
-	Body         Body             `json:"body"`
-	Attributes   []map[string]any `json:"attributes"`
+	TimeUnixNano string         `json:"timeUnixNano"`
+	Body         map[string]any `json:"body"`
+	Attributes   []Attribute    `json:"attributes"`
 }
 
-type Body struct {
-	KVListValue map[string]any `json:"kvlistValue"`
+type Attribute struct {
+	Key   string
+	Value map[string]any
 }
 
 func main() {
@@ -36,45 +43,51 @@ func main() {
 	flag.StringVar(&file, "file", "", "log file path")
 	flag.Parse()
 
-	if err := run(file); err != nil {
+	out := tabwriter.NewWriter(os.Stdout, 0, 8, 1, '\t', tabwriter.AlignRight)
+	defer out.Flush()
+	if err := run(file, out); err != nil {
 		fmt.Printf("Error: %v\n", err)
 		os.Exit(1)
 	}
 }
 
-func run(filePath string) error {
+func run(filePath string, out io.Writer) error {
 	if filePath == "" {
-		return errors.New("file path not provided")
+		return errors.New("compressed path not provided")
 	}
 
-	file, err := os.Open(filePath)
+	compressed, err := os.Open(filePath)
 	if err != nil {
-		fmt.Println(err)
+		return err
 	}
-	defer file.Close()
+	defer compressed.Close()
 
-	scanner := bufio.NewScanner(file)
-	lineNumber := 0
-	for scanner.Scan() {
-		//fmt.Println(lineNumber)
-		lineNumber++
-		var entry Entry
-		if err := json.Unmarshal(scanner.Bytes(), &entry); err != nil {
+	for {
+		logDataJSON, err := decompressChunk(compressed)
+		if err != nil {
+			if err == io.EOF {
+				break
+			}
+			return err
+		}
+
+		var logData LogData
+		if err := json.Unmarshal(logDataJSON, &logData); err != nil {
 			return fmt.Errorf("failed to unmarshal a log line: %v", err)
 		}
 
-		for _, resourceLog := range entry.ResourceLogs {
+		for _, resourceLog := range logData.ResourceLogs {
 			for _, scopeLog := range resourceLog.ScopeLogs {
 				for _, logRecord := range scopeLog.LogRecords {
-					if logRecord.Body.KVListValue == nil {
+					message := logMessage(logRecord.Body)
+
+					rawTag := stringAttributeByKey(logRecord.Attributes, "fluent.tag")
+					tag, err := parseFluentTag(rawTag)
+					if err != nil {
 						continue
 					}
 
-					attributes := flattenKeyValueList(logRecord.Body.KVListValue)
-					log, err := parseAttributes(attributes)
-					if err == nil {
-						fmt.Printf("%s/%s %s %s\n", log.namespace, log.pod, log.container, log.log)
-					}
+					fmt.Fprintf(out, "%v/%v\t%v\t%v\n", tag.namespace, tag.pod, tag.container, message)
 				}
 			}
 		}
@@ -83,45 +96,75 @@ func run(filePath string) error {
 	return nil
 }
 
-func flattenKeyValueList(node map[string]any) map[string]any {
-	results := make(map[string]any)
-	nodeValues := node["values"]
-	for _, kvUntyped := range nodeValues.([]any) {
-		kv := kvUntyped.(map[string]any)
-		newKey := kv["key"].(string)
-		var newValue any
-		if strVal, hasStrVal := kv["value"].(map[string]any)["stringValue"]; hasStrVal {
-			newValue = strVal
-		} else if kvListVal, hasKVListVal := kv["value"].(map[string]any)["kvlistValue"]; hasKVListVal {
-			newValue = flattenKeyValueList(kvListVal.(map[string]any))
+func decompressChunk(in io.Reader) ([]byte, error) {
+	sizeBuf := make([]byte, 4)
+	if err := binary.Read(in, binary.BigEndian, &sizeBuf); err != nil {
+		return nil, err
+	}
+
+	size := binary.BigEndian.Uint32(sizeBuf)
+	dataBuf := make([]byte, size)
+	if err := binary.Read(in, binary.BigEndian, &dataBuf); err != nil {
+		return nil, err
+	}
+
+	compressedChunk := bytes.NewBuffer(dataBuf)
+	var decompressedChunk bytes.Buffer
+
+	d, err := zstd.NewReader(compressedChunk)
+	if err != nil {
+		return nil, err
+	}
+	defer d.Close()
+
+	// Copy content...
+	if _, err := io.Copy(&decompressedChunk, d); err != nil {
+		return nil, err
+	}
+	return decompressedChunk.Bytes(), nil
+}
+
+func logMessage(body map[string]any) string {
+	if val, hasStringVal := body["stringValue"]; hasStringVal {
+		if stringVal, ok := val.(string); ok {
+			return stringVal
 		}
-		results[newKey] = newValue
 	}
-	return results
+	return ""
 }
 
-type logRecord struct {
-	log       string
-	namespace string
-	pod       string
-	container string
+func stringAttributeByKey(attributes []Attribute, key string) string {
+	for _, attr := range attributes {
+		if attr.Key != key {
+			continue
+		}
+		if val, hasStringVal := attr.Value["stringValue"]; hasStringVal {
+			if stringVal, ok := val.(string); ok {
+				return stringVal
+			}
+		}
+	}
+	return ""
 }
 
-func parseAttributes(attributes map[string]any) (logRecord, error) {
-	log, hasLog := attributes["log"]
-	if !hasLog {
-		return logRecord{}, errors.New("no logs")
+type fluentTag struct {
+	namespace, pod, container string
+}
+
+func parseFluentTag(tag string) (*fluentTag, error) {
+	_, tagWithoutPrefix, found := strings.Cut(tag, "kube.var.log.containers.")
+	if !found {
+		return nil, errors.New("invalid fluent tag: prefix not found")
+	}
+	tokens := strings.Split(tagWithoutPrefix, "_")
+	if len(tokens) != 3 {
+		return nil, errors.New("invalid fluent tag: must be 3 tokens")
 	}
 
-	kubernetes, hasKubernetes := attributes["kubernetes"]
-	if !hasKubernetes {
-		return logRecord{}, errors.New("no kubernetes")
-	}
-
-	return logRecord{
-		log:       log.(string),
-		namespace: kubernetes.(map[string]any)["namespace_name"].(string),
-		pod:       kubernetes.(map[string]any)["pod_name"].(string),
-		container: kubernetes.(map[string]any)["container_name"].(string),
+	containerEndIndex := strings.LastIndex(tokens[2], "-")
+	return &fluentTag{
+		namespace: tokens[1],
+		pod:       tokens[0],
+		container: tokens[2][:containerEndIndex],
 	}, nil
 }
