@@ -38,25 +38,47 @@ type Attribute struct {
 	Value map[string]any
 }
 
+type flags struct {
+	matchBy
+	file string
+}
+
+type matchBy struct {
+	namespace string
+	pod       string
+	container string
+}
+
 func main() {
-	var file string
-	flag.StringVar(&file, "file", "", "log file path")
+	var fl flags
+	flag.StringVar(&fl.file, "file", "", "log file path")
+	flag.StringVar(&fl.namespace, "namespace", "", "namespace prefix to filter for")
+	flag.StringVar(&fl.pod, "pod", "", "pod prefix to filter for")
+	flag.StringVar(&fl.container, "container", "", "container prefix to filter for")
+
 	flag.Parse()
+	if err := validate(fl); err != nil {
+		fmt.Printf("Invalid flag: %v\n", err)
+		os.Exit(1)
+	}
 
 	out := tabwriter.NewWriter(os.Stdout, 0, 8, 1, '\t', tabwriter.AlignRight)
 	defer out.Flush()
-	if err := run(file, out); err != nil {
+	if err := run(fl, out); err != nil {
 		fmt.Printf("Error: %v\n", err)
 		os.Exit(1)
 	}
 }
 
-func run(filePath string, out io.Writer) error {
-	if filePath == "" {
+func validate(fl flags) error {
+	if fl.file == "" {
 		return errors.New("compressed path not provided")
 	}
+	return nil
+}
 
-	compressed, err := os.Open(filePath)
+func run(fl flags, out io.Writer) error {
+	compressed, err := os.Open(fl.file)
 	if err != nil {
 		return err
 	}
@@ -87,7 +109,9 @@ func run(filePath string, out io.Writer) error {
 						continue
 					}
 
-					fmt.Fprintf(out, "%v/%v\t%v\t%v\n", tag.namespace, tag.pod, tag.container, message)
+					if matches(tag, fl.matchBy) {
+						fmt.Fprintf(out, "%v/%v\t%v\t%v\n", tag.namespace, tag.pod, tag.container, message)
+					}
 				}
 			}
 		}
@@ -117,7 +141,6 @@ func decompressChunk(in io.Reader) ([]byte, error) {
 	}
 	defer d.Close()
 
-	// Copy content...
 	if _, err := io.Copy(&decompressedChunk, d); err != nil {
 		return nil, err
 	}
@@ -151,20 +174,33 @@ type fluentTag struct {
 	namespace, pod, container string
 }
 
-func parseFluentTag(tag string) (*fluentTag, error) {
+func parseFluentTag(tag string) (fluentTag, error) {
 	_, tagWithoutPrefix, found := strings.Cut(tag, "kube.var.log.containers.")
 	if !found {
-		return nil, errors.New("invalid fluent tag: prefix not found")
+		return fluentTag{}, errors.New("invalid fluent tag: prefix not found")
 	}
 	tokens := strings.Split(tagWithoutPrefix, "_")
 	if len(tokens) != 3 {
-		return nil, errors.New("invalid fluent tag: must be 3 tokens")
+		return fluentTag{}, errors.New("invalid fluent tag: must be 3 tokens")
 	}
 
 	containerEndIndex := strings.LastIndex(tokens[2], "-")
-	return &fluentTag{
+	return fluentTag{
 		namespace: tokens[1],
 		pod:       tokens[0],
 		container: tokens[2][:containerEndIndex],
 	}, nil
+}
+
+func matches(tag fluentTag, by matchBy) bool {
+	if by.namespace != "" && !strings.HasPrefix(tag.namespace, by.namespace) {
+		return false
+	}
+	if by.pod != "" && !strings.HasPrefix(tag.pod, by.pod) {
+		return false
+	}
+	if by.container != "" && !strings.HasPrefix(tag.container, by.container) {
+		return false
+	}
+	return true
 }
