@@ -7,12 +7,10 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"github.com/klauspost/compress/zstd"
 	"io"
 	"os"
 	"strings"
-	"text/tabwriter"
-
-	"github.com/klauspost/compress/zstd"
 )
 
 type LogData struct {
@@ -62,9 +60,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	out := tabwriter.NewWriter(os.Stdout, 0, 8, 1, '\t', tabwriter.AlignRight)
-	defer out.Flush()
-	if err := run(fl, out); err != nil {
+	if err := run(fl, os.Stdout); err != nil {
 		fmt.Printf("Error: %v\n", err)
 		os.Exit(1)
 	}
