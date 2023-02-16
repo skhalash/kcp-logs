@@ -103,6 +103,8 @@ func run(fl flags, out io.Writer) error {
 				for _, logRecord := range scopeLog.LogRecords {
 					message := logMessage(logRecord.Body)
 
+					timestamp := stringAttributeByKey(logRecord.Attributes, "time")
+
 					rawTag := stringAttributeByKey(logRecord.Attributes, "fluent.tag")
 					tag, err := parseFluentTag(rawTag)
 					if err != nil {
@@ -110,7 +112,7 @@ func run(fl flags, out io.Writer) error {
 					}
 
 					if matches(tag, fl.matchBy) {
-						fmt.Fprintf(out, "%v/%v\t%v\t%v\n", tag.namespace, tag.pod, tag.container, message)
+						fmt.Fprintf(out, "%v/%v\t%v\t%v\t%v\n", tag.namespace, tag.pod, tag.container, timestamp, message)
 					}
 				}
 			}
