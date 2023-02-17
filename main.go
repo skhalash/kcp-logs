@@ -11,6 +11,7 @@ import (
 	"io"
 	"os"
 	"strings"
+	"time"
 )
 
 type LogData struct {
@@ -38,7 +39,8 @@ type Attribute struct {
 
 type flags struct {
 	matchBy
-	file string
+	file  string
+	since time.Duration
 }
 
 type matchBy struct {
@@ -53,6 +55,7 @@ func main() {
 	flag.StringVar(&fl.namespace, "namespace", "", "namespace prefix to filter for")
 	flag.StringVar(&fl.pod, "pod", "", "pod prefix to filter for")
 	flag.StringVar(&fl.container, "container", "", "container prefix to filter for")
+	flag.DurationVar(&fl.since, "since", time.Duration(0), "only return logs newer than a relative duration like 5s, 2m, or 3h")
 
 	flag.Parse()
 	if err := validate(fl); err != nil {
@@ -99,7 +102,18 @@ func run(fl flags, out io.Writer) error {
 				for _, logRecord := range scopeLog.LogRecords {
 					message := logMessage(logRecord.Body)
 
-					timestamp := stringAttributeByKey(logRecord.Attributes, "time")
+					rawTimestamp := stringAttributeByKey(logRecord.Attributes, "time")
+					timestamp, err := time.Parse(time.RFC3339, rawTimestamp)
+					if err != nil {
+						continue
+					}
+
+					if fl.since != time.Duration(0) {
+						fromTimestamp := time.Now().UTC().Add(-1 * fl.since)
+						if timestamp.Before(fromTimestamp) {
+							continue
+						}
+					}
 
 					rawTag := stringAttributeByKey(logRecord.Attributes, "fluent.tag")
 					tag, err := parseFluentTag(rawTag)
